@@ -143,3 +143,17 @@ def test_feasible_but_not_selected_has_reason():
     assert c18["feasible"] is True
     assert c18["selected"] is False
     assert any("偏差" in r for r in c18["reasons"])
+
+
+def test_huge_integer_computed_exactly():
+    # 2^53 + 1：Python 任意精度整数必须按原值精确计算，不得静默舍入
+    huge = 9007199254740993
+    result = compute_layout(make(floor_height_mm=huge, riser_min_mm=1,
+                                 riser_max_mm=10**18, tread_min_mm=1,
+                                 tread_max_mm=10**9, target_riser_mm=1))
+    assert result["status"] == "ok"
+    sol = result["solution"]
+    assert sol["steps"] == 40  # 目标 1mm → 精确高度最小的 40 级最接近
+    assert sum(sol["riser_sequence_mm"]) == huge
+    assert sol["total_height_mm"] == huge
+    assert max(sol["riser_sequence_mm"]) - min(sol["riser_sequence_mm"]) <= 1

@@ -93,6 +93,20 @@ def test_interval_inversion_clears_result(page):
     expect(page.get_by_test_id("solution")).to_have_count(0)
 
 
+def test_oversized_integer_explicitly_rejected(page):
+    """9007199254740993（2^53+1）超出浏览器安全整数范围：必须明确拒绝，
+    不得静默按 9007199254740992 计算。"""
+    page.goto(WEB)
+    expect(page.get_by_test_id("solution")).to_be_visible()
+    page.get_by_test_id("floor-height").fill("9007199254740993")
+    expect(page.get_by_test_id("floor-height-error")).to_contain_text("9007199254740991")
+    expect(page.get_by_test_id("solution")).to_have_count(0)
+    # 边界值 2^53-1 仍合法：不报字段错误（物理上无候选 → 无法放样结论）
+    page.get_by_test_id("floor-height").fill("9007199254740991")
+    expect(page.get_by_test_id("floor-height-error")).to_have_count(0)
+    expect(page.get_by_test_id("no-solution")).to_be_visible()
+
+
 def test_no_solution_shows_only_conclusion(page):
     page.goto(WEB)
     page.get_by_test_id("riser-min").fill("170")

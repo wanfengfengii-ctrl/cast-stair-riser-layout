@@ -113,3 +113,21 @@ def test_interval_lower_greater_than_upper_rejected():
 def test_missing_field_rejected():
     payload = {k: v for k, v in BASE.items() if k != "run_length_mm"}
     assert post(payload).status_code == 422
+
+
+def test_huge_integer_preserved_exactly():
+    # 2^53 + 1：API 必须按原值精确计算（保持原值），不得静默舍入为 2^53
+    huge = 9007199254740993
+    payload = dict(
+        floor_height_mm=huge, run_length_mm=4800,
+        riser_min_mm=1, riser_max_mm=10**18,
+        tread_min_mm=1, tread_max_mm=10**9,
+        target_riser_mm=1,
+    )
+    r = post(payload)
+    assert r.status_code == 200
+    sol = r.json()["solution"]
+    assert sol["steps"] == 40
+    # JSON 整数往返后序列总和仍精确等于原值
+    assert sum(sol["riser_sequence_mm"]) == huge
+    assert sol["total_height_mm"] == huge

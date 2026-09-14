@@ -21,6 +21,8 @@ const DEFAULTS = {
 }
 
 const INTEGER_RE = /^\d+$/
+// 浏览器安全整数上限 2^53 - 1：超出后 JSON 数字无法精确表示，必须明确拒绝而非静默舍入
+const MAX_SAFE_INTEGER = 9007199254740991
 
 function validate(values) {
   const errors = {}
@@ -30,6 +32,8 @@ function validate(values) {
       errors[f.key] = '必填'
     } else if (!INTEGER_RE.test(raw) || parseInt(raw, 10) <= 0) {
       errors[f.key] = '必须为正整数（毫米）'
+    } else if (!Number.isSafeInteger(Number(raw))) {
+      errors[f.key] = `超出可精确表示的整数上限（${MAX_SAFE_INTEGER}）`
     }
   }
   const num = (k) => parseInt(values[k], 10)
