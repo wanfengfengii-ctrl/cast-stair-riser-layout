@@ -2,9 +2,17 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.logic import MAX_STEPS, MIN_STEPS, LayoutParams, compute_layout
+from app.logic import (
+    MAX_STEPS,
+    MIN_STEPS,
+    InvalidSelectionError,
+    LayoutParams,
+    compute_layout,
+)
 
 
 def make(**overrides) -> LayoutParams:
@@ -157,3 +165,73 @@ def test_huge_integer_computed_exactly():
     assert sum(sol["riser_sequence_mm"]) == huge
     assert sol["total_height_mm"] == huge
     assert max(sol["riser_sequence_mm"]) - min(sol["riser_sequence_mm"]) <= 1
+
+
+def test_default_response_carries_recommendation_and_auto_source():
+    # 未携带 selected_steps：原排序结果，补充推荐踏步数与选用来源
+    result = compute_layout(make())
+    assert result["recommended_steps"] == 17
+    assert result["selection_source"] == "auto"
+    assert result["solution"]["steps"] == 17
+    rec = [c for c in result["candidates"] if c["recommended"]]
+    assert [c["steps"] for c in rec] == [17]
+    selected = [c for c in result["candidates"] if c["selected"]]
+    assert [c["steps"] for c in selected] == [17]
+
+
+def test_no_solution_has_null_recommendation_fields():
+    result = compute_layout(make(riser_min_mm=170, riser_max_mm=172))
+    assert result["status"] == "no_solution"
+    assert result["recommended_steps"] is None
+    assert result["selection_source"] is None
+    assert all(not c["recommended"] and not c["selected"] for c in result["candidates"])
+
+
+def test_manual_selection_uses_chosen_feasible_steps_and_keeps_recommendation():
+    # 推荐 17 级；人工改选同为可行候选的 18 级
+    result = compute_layout(make(), selected_steps=18)
+    assert result["status"] == "ok"
+    assert result["recommended_steps"] == 17       # 推荐项标识保留
+    assert result["selection_source"] == "manual"
+    sol = result["solution"]
+    assert sol["steps"] == 18
+    assert sol["treads"] == 17
+    # 3000 = 18*166 + 12：前 12 级 167，其余 166
+    assert sol["riser_sequence_mm"] == [167] * 12 + [166] * 6
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert sol["total_height_mm"] == 3000
+    assert sol["max_riser_diff_mm"] == 1
+    # 4800/17 ≈ 282.35 → 282
+    assert abs(sol["exact_tread_mm"] - 4800 / 17) < 1e-9
+    assert sol["tread_display_mm"] == 282
+    # 推荐标记仍在 17 级，选中标记移到 18 级
+    by_steps = {c["steps"]: c for c in result["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is False
+    assert by_steps[18]["recommended"] is False and by_steps[18]["selected"] is True
+
+
+def test_manual_selection_of_recommended_is_still_manual_layout():
+    result = compute_layout(make(), selected_steps=17)
+    assert result["recommended_steps"] == 17
+    assert result["selection_source"] == "manual"
+    assert result["solution"]["steps"] == 17
+
+
+@pytest.mark.parametrize("bad_steps", [1, 41, 0, -3, 100])
+def test_out_of_range_selection_rejected(bad_steps):
+    with pytest.raises(InvalidSelectionError) as exc:
+        compute_layout(make(), selected_steps=bad_steps)
+    assert str(bad_steps) in str(exc.value)
+
+
+def test_infeasible_selection_rejected_with_constraint_reason():
+    # 21 级：3000/21 ≈ 142.86 < 150，已被高度约束淘汰
+    with pytest.raises(InvalidSelectionError) as exc:
+        compute_layout(make(), selected_steps=21)
+    message = str(exc.value)
+    assert "21" in message and "可行候选" in message and "低于下限" in message
+
+
+def test_selection_rejected_when_no_solution():
+    with pytest.raises(InvalidSelectionError):
+        compute_layout(make(riser_min_mm=170, riser_max_mm=172), selected_steps=17)

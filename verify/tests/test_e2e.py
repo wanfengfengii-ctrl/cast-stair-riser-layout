@@ -2,6 +2,7 @@
 
 默认基址 http://web（compose 网络内由 nginx 反代到 API），可用 WEB_BASE_URL 覆盖。
 """
+import json
 import os
 
 import pytest
@@ -68,6 +69,98 @@ def test_main_flow_through_proxy(page):
     expect(page.get_by_test_id("candidate-row-40")).to_contain_text("低于下限")
     # 可行但未选中：18 级给出偏差原因
     expect(page.get_by_test_id("candidate-row-18")).to_contain_text("偏差")
+
+
+def test_default_recommendation_is_marked_auto(page):
+    """场景一：默认结果为自动推荐，结论处标明来源。"""
+    page.goto(WEB)
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    expect(page.get_by_test_id("selection-source")).to_have_text("自动推荐")
+    expect(page.get_by_test_id("candidate-row-17")).to_contain_text("选中")
+    # 仅可行候选出现“采用此方案”：默认输入下 16–20 级可行，17 已选中 → 4 个按钮
+    expect(page.locator('[data-testid^="adopt-"]')).to_have_count(4)
+    for steps in (16, 18, 19, 20):
+        expect(page.get_by_test_id(f"adopt-{steps}")).to_be_visible()
+    # 被高度/深度约束淘汰的候选没有按钮
+    expect(page.get_by_test_id("adopt-15")).to_have_count(0)
+    expect(page.get_by_test_id("adopt-21")).to_have_count(0)
+
+
+def test_adopt_feasible_candidate_replaces_layout_in_place(page):
+    """场景二：浏览器改选可行候选，原位替换结论与放样表，推荐项标识保留。"""
+    page.goto(WEB)
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+
+    page.get_by_test_id("adopt-18").click()
+
+    # 结论原位替换为 18 级，并标明人工选用
+    expect(page.get_by_test_id("step-count")).to_have_text("18")
+    expect(page.get_by_test_id("selection-source")).to_have_text("人工选用")
+    expect(page.get_by_test_id("recommended-steps")).to_have_text("17")
+    # 踏面取值随方案替换：4800/17 ≈ 282.35 → 282
+    expect(page.get_by_test_id("tread-display")).to_have_text("282 mm")
+    # 放样表替换为 18 行：3000 = 18*166 + 12，前 12 级 167，其余 166
+    expect(page.locator('[data-testid^="riser-row-"]')).to_have_count(18)
+    for i in range(1, 13):
+        expect(riser_cell(page, i)).to_have_text("167")
+    for i in range(13, 19):
+        expect(riser_cell(page, i)).to_have_text("166")
+    # 选中标记移到 18 级；17 级保留推荐标识
+    expect(page.get_by_test_id("candidate-row-18")).to_contain_text("选中")
+    expect(page.get_by_test_id("candidate-row-17")).to_contain_text("自动推荐")
+    expect(page.get_by_test_id("candidate-selected")).to_have_count(1)
+    expect(page.get_by_test_id("candidate-recommended")).to_have_count(1)
+
+
+def test_changing_dimension_restores_auto_recommendation(page):
+    """场景三：人工改选后，任一尺寸变化即清除人工选择并恢复自动推荐。"""
+    page.goto(WEB)
+    page.get_by_test_id("adopt-18").click()
+    expect(page.get_by_test_id("step-count")).to_have_text("18")
+    expect(page.get_by_test_id("selection-source")).to_have_text("人工选用")
+
+    # 放宽踏面上限（不改变推荐排序：仍推荐 17 级），触发尺寸变化
+    page.get_by_test_id("tread-max").fill("330")
+
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    expect(page.get_by_test_id("selection-source")).to_have_text("自动推荐")
+    expect(page.get_by_test_id("tread-display")).to_have_text("300 mm")
+    # 推荐与选中重新合并且无人工选用说明
+    expect(page.get_by_test_id("selection-note")).to_have_count(0)
+    expect(page.get_by_test_id("candidate-recommended")).to_have_count(0)
+    expect(page.get_by_test_id("candidate-row-17")).to_contain_text("选中")
+
+
+def test_switch_failure_keeps_current_valid_solution(page):
+    """场景四（页面侧）：改选请求失败时保留当前有效方案并提示未能切换。"""
+    page.goto(WEB)
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+
+    def fail_manual_only(route):
+        body = json.loads(route.request.post_data or "{}")
+        if "selected_steps" in body:
+            route.fulfill(status=500, json={"detail": "模拟服务故障"})
+        else:
+            route.continue_()
+
+    page.route("**/api/layout", fail_manual_only)
+    page.get_by_test_id("adopt-18").click()
+
+    # 明确提示未能切换
+    expect(page.get_by_test_id("switch-error")).to_be_visible()
+    expect(page.get_by_test_id("switch-error")).to_contain_text("未能切换")
+    # 当前有效方案原样保留，避免误把失败当成功
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    expect(page.get_by_test_id("selection-source")).to_have_text("自动推荐")
+    expect(page.locator('[data-testid^="riser-row-"]')).to_have_count(17)
+    expect(page.get_by_test_id("candidate-row-17")).to_contain_text("选中")
+    expect(page.get_by_test_id("tread-display")).to_have_text("300 mm")
+
+    # 故障解除后可正常改选
+    page.unroute("**/api/layout")
+    page.get_by_test_id("adopt-18").click()
+    expect(page.get_by_test_id("step-count")).to_have_text("18")
+    expect(page.get_by_test_id("switch-error")).to_have_count(0)
 
 
 def test_invalid_input_clears_result_immediately(page):

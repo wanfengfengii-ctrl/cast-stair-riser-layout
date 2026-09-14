@@ -32,6 +32,9 @@ def test_main_flow():
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "ok"
+    # 兼容旧请求：默认得到自动推荐，补充推荐踏步数与选用来源
+    assert data["recommended_steps"] == 17
+    assert data["selection_source"] == "auto"
     sol = data["solution"]
     # 3000/17≈176.47 距目标 175 最近
     assert sol["steps"] == 17
@@ -41,10 +44,12 @@ def test_main_flow():
     assert sol["total_height_mm"] == 3000
     assert sol["max_riser_diff_mm"] <= 1
     assert sol["tread_display_mm"] == 300
-    # 候选覆盖 2..40，唯一选中，未选中者均有淘汰原因
+    # 候选覆盖 2..40，唯一选中，推荐项与选中一致，未选中者均有淘汰原因
     assert [c["steps"] for c in data["candidates"]] == list(range(2, 41))
     selected = [c for c in data["candidates"] if c["selected"]]
     assert len(selected) == 1 and selected[0]["steps"] == 17
+    recommended = [c for c in data["candidates"] if c["recommended"]]
+    assert len(recommended) == 1 and recommended[0]["steps"] == 17
     assert all(c["reasons"] for c in data["candidates"] if not c["selected"])
 
 
@@ -131,3 +136,63 @@ def test_huge_integer_preserved_exactly():
     # JSON 整数往返后序列总和仍精确等于原值
     assert sum(sol["riser_sequence_mm"]) == huge
     assert sol["total_height_mm"] == huge
+
+
+def test_manual_selection_of_feasible_candidate():
+    r = post({**BASE, "selected_steps": 18})
+    assert r.status_code == 200
+    data = r.json()
+    # 推荐项保持原排序结果（17 级），放样按指定的 18 级生成
+    assert data["recommended_steps"] == 17
+    assert data["selection_source"] == "manual"
+    sol = data["solution"]
+    assert sol["steps"] == 18
+    assert sol["treads"] == 17
+    # 3000 = 18*166 + 12：前 12 级 167，其余 166
+    assert sol["riser_sequence_mm"] == [167] * 12 + [166] * 6
+    assert sol["total_height_mm"] == 3000
+    assert sol["tread_display_mm"] == 282  # 4800/17 ≈ 282.35
+    by_steps = {c["steps"]: c for c in data["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is False
+    assert by_steps[18]["recommended"] is False and by_steps[18]["selected"] is True
+
+
+def test_selected_steps_equal_to_recommendation():
+    data = post({**BASE, "selected_steps": 17}).json()
+    assert data["recommended_steps"] == 17
+    assert data["selection_source"] == "manual"
+    assert data["solution"]["steps"] == 17
+
+
+@pytest.mark.parametrize("bad_steps", [1, 41, 0, 100, 21, 15])
+def test_infeasible_or_out_of_range_selection_returns_422(bad_steps):
+    # 21 级被踏步高度下限淘汰（142.86 < 150）；15 级被上限淘汰（200 > 190）
+    r = post({**BASE, "selected_steps": bad_steps})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    # 错误可定位到 selected_steps
+    locs = [tuple(e["loc"]) for e in detail]
+    assert ("body", "selected_steps") in locs
+    assert any(str(bad_steps) in e["msg"] for e in detail)
+
+
+def test_selected_steps_wrong_type_returns_422():
+    assert post({**BASE, "selected_steps": "18"}).status_code == 422
+    assert post({**BASE, "selected_steps": 18.5}).status_code == 422
+    assert post({**BASE, "selected_steps": True}).status_code == 422
+
+
+def test_selected_steps_with_no_solution_returns_422():
+    payload = {**BASE, "riser_min_mm": 170, "riser_max_mm": 172, "selected_steps": 17}
+    r = post(payload)
+    assert r.status_code == 422
+    locs = [tuple(e["loc"]) for e in r.json()["detail"]]
+    assert ("body", "selected_steps") in locs
+
+
+def test_no_solution_response_shape_unchanged():
+    data = post({**BASE, "riser_min_mm": 170, "riser_max_mm": 172}).json()
+    assert data["status"] == "no_solution"
+    assert data["solution"] is None
+    assert data["recommended_steps"] is None
+    assert data["selection_source"] is None

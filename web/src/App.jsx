@@ -52,10 +52,27 @@ function fmt(x) {
   return x.toFixed(2).replace(/0$/, '').replace(/\.$/, '')
 }
 
+/** 从 422 响应中取出可定位字段的说明文本。 */
+async function readErrorDetail(res) {
+  try {
+    const body = await res.json()
+    if (Array.isArray(body.detail)) {
+      return body.detail.map((d) => d.msg).filter(Boolean).join('；')
+    }
+    if (typeof body.detail === 'string') return body.detail
+  } catch {
+    // 响应体不是 JSON：退回通用提示
+  }
+  return ''
+}
+
 export default function App() {
   const [values, setValues] = useState(DEFAULTS)
   const [result, setResult] = useState(null)
   const [apiError, setApiError] = useState(null)
+  // 人工选用：{ steps, nonce }；null 表示自动推荐。nonce 允许对同一踏步数重新发起改选请求。
+  const [selection, setSelection] = useState(null)
+  const [switchError, setSwitchError] = useState(null)
   const [loading, setLoading] = useState(false)
   const requestId = useRef(0)
 
@@ -67,14 +84,17 @@ export default function App() {
       // 字段非法：立即清除旧结果
       setResult(null)
       setApiError(null)
+      setSwitchError(null)
       setLoading(false)
       return
     }
     setLoading(true)
     const id = ++requestId.current
+    const manual = selection !== null // 本次请求是否为人工改选（决定失败时是否保留当前方案）
     const timer = setTimeout(async () => {
       const payload = {}
       for (const f of FIELDS) payload[f.key] = parseInt(values[f.key], 10)
+      if (selection) payload.selected_steps = selection.steps
       try {
         const res = await fetch('/api/layout', {
           method: 'POST',
@@ -83,24 +103,48 @@ export default function App() {
         })
         if (id !== requestId.current) return // 已有更新的请求，丢弃过期响应
         if (!res.ok) {
-          setResult(null)
-          setApiError(`计算请求失败（HTTP ${res.status}）`)
+          if (manual) {
+            // 改选失败：保留当前有效方案，原位提示未能切换，避免现场误把失败当成功
+            const detail = await readErrorDetail(res)
+            const wanted = selection?.steps
+            setSwitchError(
+              `未能切换到 ${wanted} 级踏步方案（HTTP ${res.status}）${detail ? `：${detail}` : ''}，当前仍显示原方案。`,
+            )
+          } else {
+            setResult(null)
+            setApiError(`计算请求失败（HTTP ${res.status}）`)
+          }
         } else {
           setResult(await res.json())
           setApiError(null)
+          setSwitchError(null)
         }
       } catch {
         if (id !== requestId.current) return
-        setResult(null)
-        setApiError('无法连接计算服务')
+        if (manual) {
+          setSwitchError('无法连接计算服务，未能切换踏步方案；当前仍显示原方案。')
+        } else {
+          setResult(null)
+          setApiError('无法连接计算服务')
+        }
       } finally {
         if (id === requestId.current) setLoading(false)
       }
     }, 250)
     return () => clearTimeout(timer)
-  }, [values, valid])
+  }, [values, valid, selection])
 
-  const onChange = (key) => (e) => setValues((v) => ({ ...v, [key]: e.target.value }))
+  const onChange = (key) => (e) => {
+    setValues((v) => ({ ...v, [key]: e.target.value }))
+    // 任一尺寸变化：清除人工选用，恢复自动推荐
+    if (selection !== null) setSelection(null)
+  }
+
+  // 复用当前表单输入，仅携带 selected_steps 重新请求
+  const adopt = (steps) => {
+    setSwitchError(null)
+    setSelection({ steps, nonce: Date.now() })
+  }
 
   return (
     <div className="page">
@@ -132,6 +176,7 @@ export default function App() {
 
       {loading && <p className="loading" data-testid="loading">计算中…</p>}
       {apiError && <p className="api-error" data-testid="api-error">{apiError}</p>}
+      {switchError && <p className="api-error" data-testid="switch-error">{switchError}</p>}
 
       {result && result.status === 'no_solution' && (
         <section className="conclusion no-solution" data-testid="no-solution">
@@ -145,20 +190,33 @@ export default function App() {
       )}
 
       {result && result.status === 'ok' && result.solution && (
-        <Solution result={result} />
+        <Solution result={result} switching={loading && selection !== null} onAdopt={adopt} />
       )}
     </div>
   )
 }
 
-function Solution({ result }) {
+function Solution({ result, switching, onAdopt }) {
   const sol = result.solution
+  const isManual = result.selection_source === 'manual'
   return (
     <>
       <section className="conclusion" data-testid="solution">
         <h2>
           放样结论：<span data-testid="step-count">{sol.steps}</span> 级踏步（{sol.treads} 个踏面）
+          {isManual ? (
+            <span className="badge badge-manual" data-testid="selection-source">人工选用</span>
+          ) : (
+            <span className="badge badge-auto" data-testid="selection-source">自动推荐</span>
+          )}
         </h2>
+        {isManual && (
+          <p className="selection-note" data-testid="selection-note">
+            当前为现场人工选用方案；系统自动推荐为
+            <strong data-testid="recommended-steps"> {result.recommended_steps} </strong>
+            级。修改任一尺寸即恢复自动推荐。
+          </p>
+        )}
         <div className="summary-grid">
           <div>
             <span className="summary-label">精确踏步高度</span>
@@ -223,6 +281,7 @@ function Solution({ result }) {
                 <th>精确踏面深度（mm）</th>
                 <th>与目标偏差（mm）</th>
                 <th>结论 / 淘汰原因</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -238,9 +297,37 @@ function Solution({ result }) {
                   <td>{fmt(c.exact_tread_mm)}</td>
                   <td>{fmt(c.deviation_mm)}</td>
                   <td>
-                    {c.selected
-                      ? <span data-testid="candidate-selected">✓ 选中</span>
-                      : c.reasons.join('；')}
+                    {c.selected ? (
+                      <span data-testid="candidate-selected">
+                        ✓ 选中{isManual ? '（人工选用）' : '（自动推荐）'}
+                      </span>
+                    ) : c.recommended ? (
+                      <>
+                        <span className="badge badge-auto" data-testid="candidate-recommended">☆ 自动推荐</span>
+                        <span className="cell-reason">{c.reasons.join('；')}</span>
+                      </>
+                    ) : (
+                      c.reasons.join('；')
+                    )}
+                  </td>
+                  <td>
+                    {c.feasible && !c.selected && (
+                      <button
+                        type="button"
+                        className="adopt-btn"
+                        data-testid={`adopt-${c.steps}`}
+                        disabled={switching}
+                        onClick={() => onAdopt(c.steps)}
+                      >
+                        采用此方案
+                      </button>
+                    )}
+                    {c.feasible && c.selected && (
+                      <button type="button" className="adopt-btn" disabled>
+                        当前采用
+                      </button>
+                    )}
+                    {!c.feasible && <span className="muted">—</span>}
                   </td>
                 </tr>
               ))}
