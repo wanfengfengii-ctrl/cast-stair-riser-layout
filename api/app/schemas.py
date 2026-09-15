@@ -1,7 +1,18 @@
 """请求模型：所有尺寸必须为正整数毫米，区间下限不得大于上限。"""
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class ControlPointIn(BaseModel):
+    # strict=True：拒绝字符串、浮点、布尔等隐式转换，只接受 JSON 整数
+    model_config = ConfigDict(strict=True)
+
+    # 现场复测得到的中间级控制点：级号与该级累计标高。
+    # 取值范围（首末级之间、严格递增）由领域计算按当前踏步数校验，
+    # 非法值返回可定位到 body.control_points.{序号} 的 422。
+    step: int = Field(description="控制点级号（1 为第一级）")
+    height_mm: int = Field(description="该级现场复测累计标高（毫米）")
 
 
 class LayoutRequest(BaseModel):
@@ -18,6 +29,10 @@ class LayoutRequest(BaseModel):
     # 可选：现场人工选用的踏步数；缺省时按目标偏差自动推荐。
     # 取值范围与可行性由领域计算校验，非法值返回可定位到本字段的 422。
     selected_steps: Optional[int] = Field(default=None, description="人工选用的踏步数")
+    # 可选：现场复测的中间标高控制点；缺省（或空列表）时逐级序列与旧响应完全不变。
+    control_points: Optional[List[ControlPointIn]] = Field(
+        default=None, description="中间标高控制点（级号、累计标高）"
+    )
 
     @model_validator(mode="after")
     def _check_intervals(self) -> "LayoutRequest":

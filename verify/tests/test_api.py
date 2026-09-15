@@ -44,6 +44,9 @@ def test_main_flow():
     assert sol["total_height_mm"] == 3000
     assert sol["max_riser_diff_mm"] <= 1
     assert sol["tread_display_mm"] == 300
+    # 旧请求兼容：不带控制点时响应不出现受控字段，余数前置序列不变
+    assert "control_points" not in data
+    assert "controlled" not in sol
     # 候选覆盖 2..40，唯一选中，推荐项与选中一致，未选中者均有淘汰原因
     assert [c["steps"] for c in data["candidates"]] == list(range(2, 41))
     selected = [c for c in data["candidates"] if c["selected"]]
@@ -196,3 +199,142 @@ def test_no_solution_response_shape_unchanged():
     assert data["solution"] is None
     assert data["recommended_steps"] is None
     assert data["selection_source"] is None
+
+
+# ---------------------------------------------------------------------------
+# 中间标高控制点
+# ---------------------------------------------------------------------------
+
+
+def test_control_points_recommended_dual_points_hit_exactly():
+    """推荐方案双控制点：精确命中、受控标识、推荐/选中标记保留。"""
+    payload = {**BASE, "control_points": [
+        {"step": 5, "height_mm": 875}, {"step": 8, "height_mm": 1400}]}
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    sol = data["solution"]
+    assert sol["controlled"] is True
+    assert data["recommended_steps"] == 17 and data["selection_source"] == "auto"
+    # 控制点精确命中，末级仍精确等于层高
+    assert sol["cumulative_height_mm"][4] == 875
+    assert sol["cumulative_height_mm"][7] == 1400
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert sol["total_height_mm"] == 3000
+    # 逐级高度仍在原高度闭区间
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    # 命中值与偏差报告
+    assert data["control_points"] == [
+        {"step": 5, "height_mm": 875, "hit_height_mm": 875, "deviation_mm": 0},
+        {"step": 8, "height_mm": 1400, "hit_height_mm": 1400, "deviation_mm": 0},
+    ]
+    # 候选标记：推荐与选中仍为 17
+    by_steps = {c["steps"]: c for c in data["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is True
+
+
+def test_control_points_half_mm_grid_within_half_mm_of_ideal_line():
+    """单控制点产生半毫米级高：段内任一累计相对理想直线误差 ≤ 0.5mm。"""
+    r = post({**BASE, "control_points": [{"step": 8, "height_mm": 1400}]})
+    sol = r.json()["solution"]
+    assert sol["cumulative_height_mm"][7] == 1400
+    anchors = [(0, 0), (8, 1400), (17, 3000)]
+    cum = sol["cumulative_height_mm"]
+    for (a, ha), (b, hb) in zip(anchors, anchors[1:]):
+        m, delta = b - a, hb - ha
+        for j in range(1, m + 1):
+            got = cum[a + j - 1] - ha
+            ideal = j * delta / m
+            assert abs(got - ideal) <= 0.5 + 1e-9, (a, b, j, got, ideal)
+
+
+def test_control_points_manual_selection_hits_exactly():
+    """人工方案应用控制点：精确命中，推荐项与人工标识同时保留。"""
+    r = post({**BASE, "selected_steps": 18,
+              "control_points": [{"step": 9, "height_mm": 1500}]})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["recommended_steps"] == 17 and data["selection_source"] == "manual"
+    sol = data["solution"]
+    assert sol["controlled"] is True and sol["steps"] == 18
+    assert sol["cumulative_height_mm"][8] == 1500
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    assert data["control_points"][0]["hit_height_mm"] == 1500
+    by_steps = {c["steps"]: c for c in data["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is False
+    assert by_steps[18]["selected"] is True
+
+
+def test_control_points_empty_list_matches_old_request():
+    data = post({**BASE, "control_points": []}).json()
+    assert "control_points" not in data
+    assert "controlled" not in data["solution"]
+    assert data["solution"]["riser_sequence_mm"] == [177] * 8 + [176] * 9
+
+
+@pytest.mark.parametrize(
+    "points,idx,field",
+    [
+        ([{"step": 0, "height_mm": 100}], 0, "step"),
+        ([{"step": 17, "height_mm": 2900}], 0, "step"),
+        ([{"step": 8, "height_mm": 3100}], 0, "height_mm"),
+        ([{"step": 8, "height_mm": 0}], 0, "height_mm"),
+        ([{"step": 8, "height_mm": 1400}, {"step": 5, "height_mm": 1500}], 1, "step"),
+        ([{"step": 5, "height_mm": 1400}, {"step": 8, "height_mm": 1400}], 1, "height_mm"),
+    ],
+)
+def test_invalid_control_points_422_located_to_point(points, idx, field):
+    r = post({**BASE, "control_points": points})
+    assert r.status_code == 422
+    locs = [tuple(e["loc"]) for e in r.json()["detail"]]
+    assert ("body", "control_points", idx, field) in locs
+
+
+def test_control_point_riser_out_of_bounds_422_field_feedback():
+    """控制点导致单级高度越界：422 定位到具体控制点并说明越界级与计算高度。"""
+    r = post({**BASE, "control_points": [{"step": 1, "height_mm": 200}]})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    locs = [tuple(e["loc"]) for e in detail]
+    assert ("body", "control_points", 0, "height_mm") in locs
+    msg = "；".join(e["msg"] for e in detail)
+    assert "第 1 级" in msg and "200" in msg and "高于上限" in msg and "190" in msg
+
+
+def test_control_point_half_mm_riser_out_of_bounds_422():
+    """半毫米计算高度越界时信息给出该计算高度（175 < 178）。"""
+    r = post({**BASE, "riser_min_mm": 178,
+              "control_points": [{"step": 8, "height_mm": 1400}]})
+    assert r.status_code == 422
+    locs = [tuple(e["loc"]) for e in r.json()["detail"]]
+    assert ("body", "control_points", 0, "height_mm") in locs
+    msg = "；".join(e["msg"] for e in r.json()["detail"])
+    assert "175" in msg and "低于下限" in msg and "178" in msg
+
+
+def test_control_point_second_segment_violation_locates_second_point():
+    # 0→8 与 8→12 段合规，12→17 段平均 190.4 > 190：定位到第二个控制点
+    points = [{"step": 8, "height_mm": 1400}, {"step": 12, "height_mm": 2048}]
+    r = post({**BASE, "control_points": points})
+    assert r.status_code == 422
+    locs = [tuple(e["loc"]) for e in r.json()["detail"]]
+    assert ("body", "control_points", 1, "height_mm") in locs
+
+
+@pytest.mark.parametrize("bad", [
+    {"step": "8", "height_mm": 1400},
+    {"step": 8, "height_mm": 1400.5},
+    {"step": True, "height_mm": 1},
+    {"step": 8},
+    "junk",
+])
+def test_control_points_wrong_type_returns_422(bad):
+    assert post({**BASE, "control_points": [bad]}).status_code == 422
+
+
+def test_control_points_with_no_solution_keep_no_solution():
+    r = post({**BASE, "riser_min_mm": 170, "riser_max_mm": 172,
+              "control_points": [{"step": 3, "height_mm": 500}]})
+    assert r.status_code == 200
+    assert r.json()["status"] == "no_solution"

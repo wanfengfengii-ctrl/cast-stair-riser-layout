@@ -106,6 +106,7 @@ tbody tr:last-child td { border-bottom: none; }
 }
 .badge-auto { background: #e3f0fd; color: var(--accent); border: 1px solid var(--accent); }
 .badge-manual { background: #fff4e0; color: #a35a00; border: 1px solid #d0801a; }
+.badge-controlled { background: #ede7f6; color: #4527a0; border: 1px solid #5e35b1; }
 
 .selection-note { margin: 0 0 10px; font-size: 13px; color: var(--ok-ink); }
 .selection-note strong { font-size: 15px; }
@@ -130,3 +131,56 @@ tbody tr:last-child td { border-bottom: none; }
   color: var(--muted);
   cursor: default;
 }
+
+.control-panel {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed #b9c6d3;
+}
+.control-panel h4 { margin: 0 0 6px; font-size: 15px; color: var(--ok-ink); }
+.control-hint { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+.control-rows { display: flex; flex-direction: column; gap: 8px; }
+.control-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.control-index { padding-top: 10px; font-weight: 600; color: var(--muted); }
+.control-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.control-field input {
+  font-size: 15px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-width: 160px;
+}
+.control-field.field-error input { border-color: var(--bad-ink); }
+.control-remove {
+  align-self: center;
+  margin-top: 6px;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--bad-ink);
+  cursor: pointer;
+}
+.control-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.control-apply { background: #5e35b1; border-color: #5e35b1; }
+.control-apply:hover:not(:disabled) { background: #4527a0; }
+.control-clear {
+  font-size: 13px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--bad-ink);
+  background: #fff;
+  color: var(--bad-ink);
+  cursor: pointer;
+}
+.control-hits { margin-top: 14px; }
+.control-hits table { font-size: 13px; }
+.control-hits th { background: #ede7f6; }
+
+.row-control-point { background: #ede7f6; font-weight: 600; }

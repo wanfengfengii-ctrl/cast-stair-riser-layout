@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.logic import (
     MAX_STEPS,
     MIN_STEPS,
+    ControlPointError,
     InvalidSelectionError,
     LayoutParams,
     compute_layout,
@@ -235,3 +236,176 @@ def test_infeasible_selection_rejected_with_constraint_reason():
 def test_selection_rejected_when_no_solution():
     with pytest.raises(InvalidSelectionError):
         compute_layout(make(riser_min_mm=170, riser_max_mm=172), selected_steps=17)
+
+
+# ---------------------------------------------------------------------------
+# 中间标高控制点
+# ---------------------------------------------------------------------------
+
+
+def test_old_request_without_control_points_is_unchanged():
+    """旧请求不带控制点：响应结构与余数前置序列完全不变。"""
+    result = compute_layout(make())
+    assert "control_points" not in result
+    sol = result["solution"]
+    assert "controlled" not in sol
+    # 3000 = 17*176 + 8：前 8 级 177，其余 176
+    assert sol["riser_sequence_mm"] == [177] * 8 + [176] * 9
+    # 无控制点时累计即原商余序列前缀和
+    seq = sol["riser_sequence_mm"]
+    assert sol["cumulative_height_mm"] == [sum(seq[:j]) for j in range(1, 18)]
+
+
+def test_empty_control_points_behaves_like_absent():
+    result = compute_layout(make(), control_points=[])
+    assert "control_points" not in result
+    assert "controlled" not in result["solution"]
+    assert result["solution"]["riser_sequence_mm"] == [177] * 8 + [176] * 9
+
+
+def test_recommended_dual_control_points_hit_exactly():
+    """推荐方案上的双控制点：控制点精确命中，推荐/选中标识保留。"""
+    cps = [{"step": 5, "height_mm": 875}, {"step": 8, "height_mm": 1400}]
+    result = compute_layout(make(), control_points=cps)
+    assert result["status"] == "ok"
+    assert result["recommended_steps"] == 17
+    assert result["selection_source"] == "auto"
+    sol = result["solution"]
+    assert sol["controlled"] is True
+    assert sol["steps"] == 17
+    # 控制点精确命中
+    assert sol["cumulative_height_mm"][4] == 875
+    assert sol["cumulative_height_mm"][7] == 1400
+    # 层高终点精确命中，总和恒等于层高
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert abs(sum(sol["riser_sequence_mm"]) - 3000) < 1e-9
+    assert sol["total_height_mm"] == 3000
+    # 每级高度仍在原高度闭区间内
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    # 各控制点报告命中值与零偏差
+    report = result["control_points"]
+    assert [cp["step"] for cp in report] == [5, 8]
+    assert all(cp["hit_height_mm"] == cp["height_mm"] for cp in report)
+    assert all(cp["deviation_mm"] == 0 for cp in report)
+    # 候选标记保留
+    by_steps = {c["steps"]: c for c in result["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is True
+
+
+def test_manual_plan_control_point_hits_exactly_and_half_mm():
+    """人工方案应用控制点：命中精确，段内可为半毫米，推荐标识保留。"""
+    cps = [{"step": 9, "height_mm": 1500}]
+    result = compute_layout(make(), selected_steps=18, control_points=cps)
+    assert result["recommended_steps"] == 17
+    assert result["selection_source"] == "manual"
+    sol = result["solution"]
+    assert sol["controlled"] is True
+    assert sol["cumulative_height_mm"][8] == 1500
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert abs(sum(sol["riser_sequence_mm"]) - 3000) < 1e-9
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    # 1500/9 ≈ 166.67 → 半毫米取整后出现 166.5 / 167
+    assert any(isinstance(h, float) and abs(h - 166.5) < 1e-9 for h in sol["riser_sequence_mm"])
+    assert result["control_points"][0]["hit_height_mm"] == 1500
+    by_steps = {c["steps"]: c for c in result["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is False
+    assert by_steps[18]["selected"] is True
+
+
+def test_controlled_cumulative_within_half_mm_of_ideal_line():
+    """段内任一累计值相对理想直线的误差不超过 0.5mm（含多控制点分段）。"""
+    cps = [{"step": 5, "height_mm": 875}, {"step": 8, "height_mm": 1400}]
+    result = compute_layout(make(), control_points=cps)
+    cum = result["solution"]["cumulative_height_mm"]
+    anchors = [(0, 0), (5, 875), (8, 1400), (17, 3000)]
+    for (a, ha), (b, hb) in zip(anchors, anchors[1:]):
+        m, delta = b - a, hb - ha
+        for j in range(1, m + 1):
+            got = cum[a + j - 1] - ha
+            ideal = j * delta / m
+            assert abs(got - ideal) <= 0.5 + 1e-9, (a, b, j, got, ideal)
+
+
+def test_result_determined_uniquely_by_step_numbers():
+    """结果按级号唯一确定：字典形式与元组形式、以及重复计算的结果一致。"""
+    ordered = [{"step": 5, "height_mm": 875}, {"step": 8, "height_mm": 1400}]
+    r1 = compute_layout(make(), control_points=ordered)
+    r2 = compute_layout(make(), control_points=[(5, 875), (8, 1400)])
+    assert r1["solution"]["riser_sequence_mm"] == r2["solution"]["riser_sequence_mm"]
+    assert r1["solution"]["cumulative_height_mm"] == r2["solution"]["cumulative_height_mm"]
+
+
+@pytest.mark.parametrize(
+    "cps,index,field",
+    [
+        ([{"step": 0, "height_mm": 100}], 0, "step"),            # 取了起点级
+        ([{"step": 17, "height_mm": 2900}], 0, "step"),          # 取了末级
+        ([{"step": 8, "height_mm": 0}], 0, "height_mm"),         # 标高不在 (0,H)
+        ([{"step": 8, "height_mm": 3000}], 0, "height_mm"),      # 标高等于层高
+        ([{"step": 8, "height_mm": 1400},
+          {"step": 5, "height_mm": 1500}], 1, "step"),           # 级号未严格递增
+        ([{"step": 5, "height_mm": 1400},
+          {"step": 8, "height_mm": 1400}], 1, "height_mm"),      # 标高未严格递增
+    ],
+)
+def test_invalid_control_points_rejected_with_location(cps, index, field):
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=cps)
+    assert exc.value.index == index
+    assert exc.value.loc_field == field
+    cp = cps[index]
+    assert str(cp["step"]) in exc.value.message or field == "height_mm"
+
+
+def test_control_point_forcing_riser_above_max_returns_located_error():
+    """控制点导致单级高度越界（200 > 190）：定位到具体控制点并说明越界级与计算高度。"""
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=[{"step": 1, "height_mm": 200}])
+    err = exc.value
+    assert err.index == 0
+    assert err.riser_step == 1
+    assert abs(err.riser_half / 2 - 200) < 1e-9
+    assert "第 1 级" in err.message and "200" in err.message and "高于上限" in err.message
+    assert "[150, 190]" in err.message
+
+
+def test_control_point_forcing_half_mm_riser_below_min():
+    """半毫米级高越界示例：175mm 低于收紧后的下限 178，定位到第一个控制点。"""
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(riser_min_mm=178),
+                       control_points=[{"step": 8, "height_mm": 1400}])
+    err = exc.value
+    assert err.index == 0
+    assert err.riser_step == 1
+    assert abs(err.riser_half / 2 - 175) < 1e-9
+    assert "175" in err.message and "低于下限" in err.message and "178" in err.message
+
+
+def test_second_segment_violation_locates_second_control_point():
+    """起点段合规、控制点之后段越界：错误定位到第二个控制点并说明段范围。"""
+    # 17 级：前 8 级到 1400（175/级，合规）；后 9 级 1600 → 177.x，全部合规。
+    # 构造第二个控制点使末段平均 195 > 190：12 级累计 2340（前 8 级 1400，8→12 每级 235）
+    # 为让第二段(8→12)合规而第三段(12→17)越界：
+    # 8 级 1400（175/级），12 级 2048（4 级 648 = 162/级，合规），末 5 级 952 = 190.4 → 越界
+    cps = [{"step": 8, "height_mm": 1400}, {"step": 12, "height_mm": 2048}]
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=cps)
+    err = exc.value
+    assert err.index == 1  # 定位到第二个控制点
+    assert err.riser_step in range(13, 18)
+    assert "高于上限" in err.message
+    # 信息中包含越界级号与计算高度
+    assert f"第 {err.riser_step} 级" in err.message
+
+
+def test_no_solution_with_control_points_still_no_solution():
+    result = compute_layout(make(riser_min_mm=170, riser_max_mm=172),
+                            control_points=[{"step": 3, "height_mm": 500}])
+    assert result["status"] == "no_solution"
+    assert "control_points" not in result
+
+
+def test_control_points_accept_tuple_form():
+    # 内部规整同样接受 (级号, 累计标高) 元组形式
+    result = compute_layout(make(), control_points=[(8, 1400)])
+    assert result["solution"]["cumulative_height_mm"][7] == 1400
